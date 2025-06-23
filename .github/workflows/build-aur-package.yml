@@ -81,6 +81,7 @@ jobs:
             -e HCC_AMDGPU_TARGETS=${{ env.HCC_AMDGPU_TARGETS }} \
             -v "$(pwd):/workspace" \
             -w /workspace \
+            --user builder \
             aur-builder:latest \
             bash -c "
               sudo pacman --noconfirm -Syu
