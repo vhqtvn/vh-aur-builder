@@ -83,9 +83,9 @@ jobs:
             -w /workspace \
             aur-builder:latest \
             bash -c "
-              # Change ownership of the workspace to builder user
-              sudo chown -R builder:builder /workspace
-              # Switch to builder user and build
+              # Ensure workspace is owned by builder user
+              chown -R builder:builder /workspace
+              # Run as builder user
               sudo -u builder bash -c '
                 cd /workspace
                 sudo pacman --noconfirm -Syu
