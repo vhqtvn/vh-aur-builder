@@ -1,0 +1,165 @@
+name: Build AUR Package and Create Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'AUR package name to build'
+        required: true
+        default: 'rocblas-gfx1103'
+      package_version:
+        description: 'Package version to build'
+        required: true
+        default: ''
+
+env:
+  DEFAULT_PACKAGE: rocblas-gfx1103
+  HSA_OVERRIDE_GFX_VERSION: 11.0.2
+  HCC_AMDGPU_TARGETS: gfx1102
+
+jobs:
+  build-package:
+    runs-on: ubuntu-latest
+    outputs:
+      package_files: ${{ steps.build.outputs.package_files }}
+      package_name: ${{ steps.build.outputs.package_name }}
+      package_version: ${{ steps.build.outputs.package_version }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image locally
+        id: docker-build
+        run: |
+          # Build the Docker image locally without pushing
+          docker build -t aur-builder:latest .
+          echo "Docker image built successfully"
+
+      - name: Determine package details
+        id: package-info
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "package_name=${{ github.event.inputs.package_name }}" >> $GITHUB_OUTPUT
+            echo "package_version=${{ github.event.inputs.package_version }}" >> $GITHUB_OUTPUT
+          else
+            # For commits and PRs, use default package and generate version from commit
+            COMMIT_SHORT=$(git rev-parse --short HEAD)
+            BUILD_DATE=$(date +%Y%m%d)
+            echo "package_name=${{ env.DEFAULT_PACKAGE }}" >> $GITHUB_OUTPUT
+            echo "package_version=${BUILD_DATE}-${COMMIT_SHORT}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build AUR package
+        id: build
+        run: |
+          # Create a temporary directory for the build
+          BUILD_DIR=$(mktemp -d)
+          cd "$BUILD_DIR"
+          
+          # Clone the AUR package
+          PACKAGE_NAME="${{ steps.package-info.outputs.package_name }}"
+          echo "Building package: $PACKAGE_NAME"
+          
+          git clone "https://aur.archlinux.org/$PACKAGE_NAME.git"
+          cd "$PACKAGE_NAME"
+          
+          # Build the package using our local Docker image with environment variables
+          docker run --rm \
+            -e HSA_OVERRIDE_GFX_VERSION=${{ env.HSA_OVERRIDE_GFX_VERSION }} \
+            -e HCC_AMDGPU_TARGETS=${{ env.HCC_AMDGPU_TARGETS }} \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            aur-builder:latest \
+            bash -c "
+              sudo pacman --noconfirm -Syu
+              makepkg --syncdeps --noconfirm --skippgpcheck
+            "
+          
+          # Find all package files
+          PACKAGE_FILES=$(find . -name "*.pkg.*" -type f | tr '\n' ',' | sed 's/,$//')
+          echo "package_files=$PACKAGE_FILES" >> $GITHUB_OUTPUT
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "package_version=${{ steps.package-info.outputs.package_version }}" >> $GITHUB_OUTPUT
+          
+          # Copy package files to workspace for artifacts
+          mkdir -p /tmp/aur-artifacts
+          cp *.pkg.* /tmp/aur-artifacts/ 2>/dev/null || true
+          
+          # List built packages
+          echo "Built packages:"
+          ls -la *.pkg.* 2>/dev/null || echo "No package files found"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-packages-${{ steps.package-info.outputs.package_name }}-${{ steps.package-info.outputs.package_version }}
+          path: /tmp/aur-artifacts/*.pkg.*
+          retention-days: 30
+
+  create-release:
+    needs: build-package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.sha }}
+          release_name: Release ${{ github.sha }} - ${{ needs.build-package.outputs.package_name }}
+          body: |
+            ## AUR Package Build
+            
+            **Package:** ${{ needs.build-package.outputs.package_name }}
+            **Version:** ${{ needs.build-package.outputs.package_version }}
+            **Commit:** ${{ github.sha }}
+            **Build Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            
+            ### Build Environment
+            - HSA_OVERRIDE_GFX_VERSION: ${{ env.HSA_OVERRIDE_GFX_VERSION }}
+            - HCC_AMDGPU_TARGETS: ${{ env.HCC_AMDGPU_TARGETS }}
+            
+            ### Package Files
+            This release contains the following package files:
+            - ${{ needs.build-package.outputs.package_files }}
+            
+            ### Installation
+            ```bash
+            # Download and install the package
+            pacman -U <package-file>
+            ```
+          draft: false
+          prerelease: true
+
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/aur-packages-${{ needs.build-package.outputs.package_name }}-${{ needs.build-package.outputs.package_version }}/*.pkg.*
+          asset_name: ${{ needs.build-package.outputs.package_name }}-${{ needs.build-package.outputs.package_version }}.pkg.tar.zst
+          asset_content_type: application/octet-stream 
